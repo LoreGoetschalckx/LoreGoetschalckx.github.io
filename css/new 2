@@ -1,0 +1,367 @@
+from flask import Flask, request
+from flask_restful import Resource, Api
+from flask_cors import CORS
+
+import os
+import json
+import pandas as pd
+import datetime
+import sys
+import time
+import threading
+from filelock import Timeout, FileLock
+
+# Config
+#################################
+
+app = Flask(__name__)
+api = Api(app)
+CORS(app)
+with open("server_config.json") as f:
+    config = json.load(f)
+
+lock_assigned_sequences = FileLock(os.path.join("..", config["assignedSequencesFile"] + ".lock"))
+lock_data = FileLock(os.path.join("..", config["dataFile"] + ".lock"))
+lock_data_sandbox = FileLock(os.path.join("..", config["dataFile_sandbox"] + ".lock"))
+lock_when_to_stop = FileLock(config["whenToStopFile"] + ".lock")
+lock_submission_file = FileLock(os.path.join("..", config["submitFile"] + ".lock"))
+
+
+class InitializeRun(Resource):
+    def initialize_vars(self):
+        self.workerId = request.args.get("workerId")
+        self.medium = request.args.get("medium")
+        self.trial_feedback = request.args.get("trialFeedback")
+        self.assigned_sequences_df = pd.read_csv(os.path.join("..", config["assignedSequencesFile"]), delimiter=",")
+        self.assigned_sequences_df = self.assigned_sequences_df.set_index("workerId", drop=False)
+        self.timestamp = datetime.datetime.now()
+
+    def available_sequences(self):
+        sequence_files = os.listdir(os.path.join(config["workerSequence"]["sequencePath"]))
+        assigned_files = self.assigned_sequences_df["sequenceFile"].values.tolist()
+        assigned_files = [os.path.basename(x) for x in assigned_files]
+        available_files = [x for x in sequence_files if x not in assigned_files and x.endswith(".json")]
+        available_files = sorted(available_files)
+        return available_files
+
+    def assign_new_sequence(self, workerId):
+        if workerId in self.assigned_sequences_df["workerId"].values:
+            raise Exception('cannot assign new sequence, workerId already has one')
+        else:
+            available_files = self.available_sequences()
+            assigned_file = os.path.join(config["workerSequence"]["sequencePath"], available_files[0])
+            new_row = {"workerId": workerId,
+                       "sequenceFile": assigned_file,
+                       "indexToRun": int(0),
+                       "blocked": False,
+                       "finished": False,
+                       "timestamp": self.timestamp.__str__(),
+                       "version": config["version"]}
+
+            self.assigned_sequences_df = self.assigned_sequences_df.append(pd.DataFrame(new_row, index=[0]),
+                                                                           ignore_index=True)
+            self.assigned_sequences_df = self.assigned_sequences_df.set_index("workerId", drop=False)
+
+    def already_running(self, workerId, timestamp, new_worker):
+        if new_worker:
+            return False
+        else:
+            # if previous initialization was less than 5 minutes ago, session is probably still active
+            previous_timestamp = self.assigned_sequences_df.loc[workerId, "timestamp"]
+            previous_timestamp = datetime.datetime.strptime(previous_timestamp.__str__(), "%Y-%m-%d %H:%M:%S.%f")
+            return (timestamp - previous_timestamp) < datetime.timedelta(minutes=0)
+
+    def get_sequence_info(self, workerId, feedback):
+        assigned_file = self.assigned_sequences_df.loc[workerId, "sequenceFile"]
+        with open(assigned_file) as f:
+            sequence_info = json.load(f)
+        index_to_run = int(self.assigned_sequences_df.loc[workerId, "indexToRun"])
+
+        run_info = {"index_to_run": index_to_run,
+                    "sequenceFile": str(self.assigned_sequences_df.loc[workerId, "sequenceFile"]),
+                    "image_file_LTM": sequence_info["image_file_LTM"][index_to_run],
+                    "image_file_STM": sequence_info["image_file_STM"][index_to_run],
+                    "display0": sequence_info["display0"][index_to_run],
+                    "colors": sequence_info["colors"][index_to_run],
+                    "display1": sequence_info["display1"][index_to_run],
+                    "cue_color": sequence_info["cue_color"][index_to_run],
+                    "blocked": int(self.assigned_sequences_df.loc[workerId, "blocked"]),
+                    "finished": int(self.assigned_sequences_df.loc[workerId, "finished"]),
+                    "timestamp": self.timestamp.__str__()}
+
+        # only send correct answers along if you will be giving trial feedback (less risk of tech savvy workers using
+        # it to get perfect scores
+        if feedback:
+            run_info["condition_STM"] = sequence_info["condition_STM"][run_info["index_to_run"]]
+            run_info["condition_LTM"] = sequence_info["condition_LTM"][run_info["index_to_run"]]
+
+        return run_info
+
+    def update_df(self, run_info):
+        if not (run_info["running"] or run_info["finished"] or run_info["blocked"]):
+            if run_info["index_to_run"] + 1 >= config["workerSequence"]["maxNumBlocks"]:
+                self.assigned_sequences_df.at[self.workerId, "finished"] = True
+            else:
+                self.assigned_sequences_df.at[self.workerId, "indexToRun"] = run_info["index_to_run"] + 1
+            self.assigned_sequences_df.at[self.workerId, "timestamp"] = self.timestamp.__str__()
+            self.assigned_sequences_df.to_csv(os.path.join("..", config["assignedSequencesFile"]), index=False)
+
+    def get(self):
+        with lock_assigned_sequences:
+            self.initialize_vars()
+
+            # assign sequence file if worker is new
+            if self.workerId not in self.assigned_sequences_df["workerId"].values:
+                new_worker = True
+                self.assign_new_sequence(self.workerId)
+            else:
+                new_worker = False
+
+            # get assigned sequence info
+            return_dict = self.get_sequence_info(self.workerId, self.trial_feedback)
+
+            # check if another run might be active
+            return_dict["running"] = self.already_running(self.workerId, self.timestamp, new_worker)
+
+            # update the database
+            self.update_df(return_dict)
+
+            return return_dict
+
+
+class FinalizeRun(Resource):
+    def initialize_vars(self):
+        start = time.time()
+        self.data_received = request.get_json()
+        self.medium = self.data_received["medium"]
+        self.sequence_info = self.get_sequence_info(self.data_received["sequenceFile"])
+        with open(config["whenToStopFile"]) as f:
+            self.whenToStop = json.load(f)
+        self.return_dict = {"blocked": False,  # initializing, will be set to True if blocked,
+                            "finished": self.data_received["indexToRun"] + 1 >= config["workerSequence"][
+                                "maxNumBlocks"],
+                            "maintenance": config["maintenance"]}
+        end = time.time()
+        print("initialized vars, took ",end-start," seconds")
+
+    def get_sequence_info(self, sequence_file):
+        with open(sequence_file) as f:
+            sequence_info = json.load(f)
+        return sequence_info
+
+    def update_data_file(self):
+        start = time.time()
+        data_received = self.data_received
+        sequence_info = self.sequence_info
+        run_index = data_received["indexToRun"]
+        data = {
+            "consent": data_received["consent"],
+            "debrief": data_received["debrief"],
+            "sendRresults": data_received["sendResults"],
+            "age": data_received["age"],
+            "gender": data_received["gender"],
+            "medium": data_received["medium"],
+            "sequenceFile": data_received["sequenceFile"],
+            "workerId": data_received["workerId"],
+            "assignmentId": data_received["assignmentId"],
+            "timestamp": data_received["timestamp"],
+            "runIndex": run_index
+        }
+
+        # Setting correct data file and lock
+        if self.medium == "mturk_sandbox":
+            data_file = os.path.join("..", config["dataFile_sandbox"])
+            lock = lock_data_sandbox
+        else:
+            data_file = os.path.join("..", config["dataFile"])
+            lock = lock_data
+
+        with lock:
+            data_all = pd.read_csv(data_file)
+
+            # STM data
+            for i in range(len(data_received["responseSTM"])):
+                data["phase"] = "STM"
+                data["vigilance"] = sequence_info["vigilance_STM"][run_index][i]
+                data["condition"] = sequence_info["condition_STM"][run_index][i]
+                data["image"] = sequence_info["image_file_STM"][run_index][i]
+                data["response"] = data_received["responseSTM"][i]
+                data["trialIndex"] = i
+
+                data_all = data_all.append(pd.DataFrame(data, index=[0]), ignore_index=True)
+
+            # LTM data
+            for i in range(len(data_received["responseLTM"])):
+                data["phase"] = "LTM"
+                data["vigilance"] = sequence_info["vigilance_LTM"][run_index][i]
+                data["condition"] = sequence_info["condition_LTM"][run_index][i]
+                data["image"] = sequence_info["image_file_LTM"][run_index][i]
+                data["response"] = data_received["responseLTM"][i]
+                data["trialIndex"] = i
+
+                data_all = data_all.append(data, ignore_index=True)
+            data_all.to_csv(data_file, index=False)
+            
+        end = time.time()
+        print("updated data df, took ",end-start," seconds")
+
+
+    def compute_scores(self):
+        start = time.time()
+        data_received = self.data_received
+        sequence_info = self.sequence_info
+        run_index = data_received["indexToRun"]
+
+        num_correct_stm = 0
+        for i in range(len(data_received["responseSTM"])):
+            if data_received["responseSTM"][i] == "f":
+                if sequence_info["condition_STM"][run_index][i] == "different":
+                    num_correct_stm += 1
+            else:
+                if sequence_info["condition_STM"][run_index][i] == "same":
+                    num_correct_stm += 1
+
+        num_correct_ltm = 0
+        for i in range(len(data_received["responseLTM"])):
+            if data_received["responseLTM"][i] == "f":
+                if sequence_info["condition_LTM"][run_index][i] == "target":
+                    num_correct_ltm += 1
+            else:
+                if sequence_info["condition_LTM"][run_index][i] == "filler":
+                    num_correct_ltm += 1
+        
+        end = time.time()
+        print("computed scores, took ",end-start," seconds")
+        return {"prop_correct_stm": num_correct_stm / len(data_received["responseSTM"]),
+                "prop_correct_ltm": num_correct_ltm / len(data_received["responseLTM"])}
+
+    def evaluate_vigilance(self, vig_hr_stm_criterion, vig_hr_ltm_criterion, far_ltm_criterion):
+        start = time.time()
+        # initializing
+        data_received = self.data_received
+        sequence_info = self.sequence_info
+        run_index = data_received["indexToRun"]
+        passing_criteria = True
+
+        # finding relevant trials
+        vigilance_idx_stm = [i for i in range(len(sequence_info["vigilance_STM"][run_index])) if
+                             sequence_info["vigilance_STM"][run_index][i] and i < len(data_received["responseSTM"])]
+        vigilance_idx_ltm = [i for i in range(len(sequence_info["vigilance_LTM"][run_index])) if
+                             sequence_info["vigilance_LTM"][run_index][i] and i < len(data_received["responseLTM"])]
+        lure_idx_ltm = [i for i in range(len(sequence_info["vigilance_LTM"][run_index])) if
+                        sequence_info["condition_LTM"][run_index][i] == "filler" and i < len(
+                            data_received["responseLTM"])]
+
+        # evaluating STM vigilance trials
+        if len(vigilance_idx_stm) > 0:
+            num_correct_stm = 0
+            for idx in vigilance_idx_stm:
+                if data_received["responseSTM"][idx] == "f":
+                    if sequence_info["condition_STM"][run_index][idx] == "different":
+                        num_correct_stm += 1
+                else:
+                    if sequence_info["condition_STM"][run_index][idx] == "same":
+                        num_correct_stm += 1
+            if num_correct_stm / len(vigilance_idx_stm) < vig_hr_stm_criterion:
+                passing_criteria = False
+
+        # evaluating LTM vigilance trials
+        if len(vigilance_idx_ltm) > 0:
+            num_correct_ltm = 0
+            for idx in vigilance_idx_ltm:
+                if data_received["responseLTM"][idx] == "f":
+                    if sequence_info["condition_LTM"][run_index][idx] == "target":
+                        num_correct_ltm += 1
+                else:
+                    if sequence_info["condition_LTM"][run_index][idx] == "filler":
+                        num_correct_ltm += 1
+            if num_correct_ltm / len(vigilance_idx_ltm) < vig_hr_ltm_criterion:
+                passing_criteria = False
+
+        # evaluating LTM lures
+        if len(lure_idx_ltm) > 0:
+            num_fa_ltm = 0
+            for idx in lure_idx_ltm:
+                if data_received["responseLTM"][idx] == "f":
+                    num_fa_ltm += 1
+            if num_fa_ltm / len(lure_idx_ltm) > far_ltm_criterion:
+                passing_criteria = False
+        
+        end = time.time()
+        print("evaluated vigilance, took ",end-start," seconds")
+        return ("pass" if passing_criteria else "fail")
+
+    def block_worker(self, workerId):
+        start = time.time()
+        print("blocking")
+        self.return_dict["blocked"] = True
+
+        with lock_assigned_sequences:
+            assigned_sequences_df = pd.read_csv(os.path.join("..", config["assignedSequencesFile"]), delimiter=",")
+            assigned_sequences_df = assigned_sequences_df.set_index("workerId", drop=False)
+            assigned_sequences_df.at[workerId, "blocked"] = True
+            assigned_sequences_df.to_csv(os.path.join("..", config["assignedSequencesFile"]), index=False)
+        
+        end = time.time()
+        print("blocked worker, took ",end-start," seconds")
+
+    def update_when_to_stop_file(self, valid):
+        start = time.time()
+        with lock_when_to_stop:
+            with open(config["whenToStopFile"]) as f:
+                whenToStop = json.load(f)
+            whenToStop["numBlocksTotalSoFar"] += 1
+            whenToStop["numValidBlocksSoFar"] += valid
+            with open(config["whenToStopFile"], 'w') as fp:
+                json.dump(whenToStop, fp)
+                
+        end = time.time()
+        print("updated when to stop, took ",end-start," seconds")
+        
+
+    def post(self):
+        self.initialize_vars()
+        if not self.data_received['preview']:
+            self.update_data_file()
+            valid = 0
+
+            # Check vigilance performance and block if necessary
+            if self.data_received['workerId'] not in config["whitelistWorkerIds"]:
+                if self.evaluate_vigilance(**config["blockingCriteria"]) == "fail":
+                    self.block_worker(self.data_received["workerId"])
+                else:
+                    valid = 1
+            else:
+                valid = 1
+
+            self.update_when_to_stop_file(valid)
+
+        # Add scores to return_dict
+        self.return_dict.update(self.compute_scores())
+
+        return self.return_dict
+
+
+class SubmitRuns(Resource):
+    def initialize_vars(self):
+        self.data_received = request.get_json()
+
+    def update_submissions(self):
+        data = self.data_received
+        with lock_submission_file:
+            submitted_runs_df = pd.read_csv(os.path.join("..", config["submitFile"]))
+            submitted_runs_df = submitted_runs_df.append(data, ignore_index=True)
+            submitted_runs_df.to_csv(os.path.join("..", config["submitFile"]), index=False)
+
+    def post(self):
+        self.initialize_vars()
+        self.update_submissions()
+        return ("submission successful")
+
+
+api.add_resource(InitializeRun, '/initializerun')
+api.add_resource(FinalizeRun, '/finalizerun')
+api.add_resource(SubmitRuns, '/submitruns')
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=7000, debug=True)
