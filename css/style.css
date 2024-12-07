@@ -2028,6 +2028,10 @@ color:black;
 a.url:active{
 	color:none;
 }
+a.emphasis{
+    color:#158daf;
+	font-weight:bold;
+}
 	
 
 	
